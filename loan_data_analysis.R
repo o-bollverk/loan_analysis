@@ -1,0 +1,207 @@
+
+library(readxl)
+library(purrr)
+library(dplyr)
+library(reshape)
+library(ggplot2)
+library(gridExtra)
+library(lubridate)
+library(forecast)
+library(data.table)
+library(scales)
+
+# Task description:
+#   
+# 1. Analyse last 5 years household lending data from public sources to understand historical trends. Try to identify seasonality trends and one-offs (large one-time events, which are on top of regular trends).
+# 
+# 2. Use historical data (define reasonable period on your own) and prognose household lending in Estonia by market participants until end of 2020 (quarterly).
+# 
+# 3. Create PowerPoint presentation from results including visualizations and comments (about 2-3 slides). Explain in appendix how you came to conclusions (1-2 slides) 
+
+# 1. -----------
+
+# Eesti Panga andmete sisselugemine
+
+
+stock_and_number <- readxl::read_excel("data/report3.xls", skip = 4)
+
+# Keskendun esialgu stock üldarvudele household total puhul
+stock_and_number <- stock_and_number[,sapply(names(stock_and_number), function(x) if(!grepl("Number", stock_and_number[[x]])){return(x)} else return(NULL)) %>% reduce(., c)]
+
+names(stock_and_number) <- sapply(names(stock_and_number), substr, start = 1, stop = 10)
+names(stock_and_number)[1:3] <- c("Loan purpose", 	"Currency" ,	"Loan collateral")
+stock_and_number <- stock_and_number[,names(stock_and_number)[! is.na(names(stock_and_number))]]
+
+
+# HOUSING LOANS OUT OF TOTAL -------
+
+turnover <- readxl::read_excel("data/turnover_to_households.xls", skip = 4)
+
+names(turnover) <- sapply(names(turnover), substr, start = 1, stop = 10)
+names(turnover)[1:2] <- c("Loan purpose" ,	"Loan collateral")
+
+vaartused <- (turnover %>% 
+                filter(`Loan purpose` == "Housing loans" & `Loan collateral` == "Real estate") %>% 
+                select(-c("Loan purpose" ,	"Loan collateral")) %>%
+                mutate_all(as.numeric) %>% 
+                unlist)/
+  (turnover %>% 
+     filter(`Loan purpose` == "TOTAL" & `Loan collateral` == "TOTAL") %>% 
+     select(-c("Loan purpose" ,	"Loan collateral")) %>%
+     mutate_all(as.numeric) %>% 
+     unlist)
+
+
+kuupaev <- (turnover %>% 
+              filter(`Loan purpose` == "TOTAL" & `Loan collateral` == "TOTAL") %>% 
+              select(-c("Loan purpose" ,	"Loan collateral")) %>%
+              mutate_all(as.numeric) %>% 
+              unlist) %>% 
+  names() %>% 
+  paste0("01/", .) %>% 
+  as.POSIXct(., format = "%d/%m/%Y")
+kuupaev <- kuupaev[!is.na(kuupaev)]
+
+graaf_tabel <- data.frame(kuupaev, vaartused)
+
+graaf_tabel$kuupaev <- as.Date(graaf_tabel$kuupaev)
+
+# turnover osakaal
+ggplot(graaf_tabel, aes(x = kuupaev, y = vaartused), breaks = 1) + geom_line() + scale_x_date(date_breaks = "1 year" )
+
+
+
+# võimalik sessoonsuse tuvastamine ---------
+# kahekuuline vahe
+
+graaf_tabel2 <- graaf_tabel
+graaf_tabel2$vaartused <-  c(graaf_tabel2$vaartused[-c(1:2)], 0, 0) - graaf_tabel2$vaartused
+kahekuuline <- ggplot(graaf_tabel2, aes(x = kuupaev, y = vaartused), breaks = 1) + geom_line() + scale_x_date(date_breaks = "1 year" )
+
+lag_vaartus_fun <- function(lag_vaartus, graaf_tabel2){
+  
+  graaf_tabel2$vaartused <-  graaf_tabel2$vaartused - graaf_tabel2$vaartused %>% lag(., lag_vaartus)
+  
+  # posiiitvne graafik
+  viitega <- ggplot(graaf_tabel2, aes(x = kuupaev, y = vaartused), breaks = 1) + 
+    geom_line() + 
+    scale_x_date(date_breaks = "1 year" ) +
+    labs(y = paste0("Change in turnover of loans (", lag_vaartus, " months)")) +
+    xlab("Date") +
+    ylim(c(-0.2,0.2))
+  
+  return(viitega)
+}
+
+p1 <- lag_vaartus_fun(graaf_tabel2 = graaf_tabel, lag_vaartus = 1) 
+p2 <- lag_vaartus_fun(graaf_tabel2 = graaf_tabel, lag_vaartus = 2) 
+p3 <- lag_vaartus_fun(graaf_tabel2 = graaf_tabel, lag_vaartus = 3) 
+p4 <- lag_vaartus_fun(graaf_tabel2 = graaf_tabel, lag_vaartus = 4) 
+
+# graafikud sõltuvad kuulisest erinevusest. Kas erisused on lihtsalt kuulised hüpped või on muutus
+# märgatav kui mitme kuuga võrrelda. 2016 muutus paistab silma
+
+grid.arrange(p1,p2,p3,p4) 
+
+
+# 2. ----------------
+
+# andmete sisselugemine
+# lisada aja tunnus
+
+pangad <- lapply(c("data/andmed.xls", paste0("data/andmed","(", 1:21, ").xls")), function(x){
+  read_excel(x) %>% dplyr::rename(Antud_laenud = ...1 )
+})
+
+# kuupäeva lisamine
+
+d <- ymd(as.Date("2013-12-31"))
+
+for (i in 1:length(pangad)){
+  vastus <- d %m+% months(3*i)
+  pangad[[i]] <- pangad[[i]] %>% mutate(KUUPAEV = vastus)
+}
+
+
+# valin need pangad, millega aegrea moodustamisel probleemi ei teki
+
+pangad <- lapply(pangad, function(y) (y %>% filter(grepl("Kodumajapidamised|Eraisikud", Antud_laenud)) %>% 
+                                        select(BIG,COOP, HANDELSB,LHV, DANSKE, SEB, SWED, TBB, KUUPAEV))[1,])
+
+
+pangad2 <- rbindlist(pangad)
+
+# Prognoosmine 2020 viimase  kvartalini (loess) ---------------
+
+# esmalt teha freimile juurde pikenev periood
+
+pangad2 <- rbindlist(pangad)
+juurde <- c()
+for ( i in (1:6)){
+  juurde <- c(juurde, as.character(pangad2$KUUPAEV[length(pangad2$KUUPAEV)]  %m+% months(3*i)))
+}
+
+juurde  <- data.frame(c(as.character(pangad2$KUUPAEV),juurde), stringsAsFactors = F)
+names(juurde) <- "KUUPAEV2"
+
+cbind.fill<-function(...){
+  nm <- list(...) 
+  nm<-lapply(nm, as.matrix)
+  n <- max(sapply(nm, nrow)) 
+  do.call(cbind, lapply(nm, function (x) 
+    rbind(x, matrix(, n-nrow(x), ncol(x))))) 
+}
+
+pangad2  <- cbind.fill(pangad2, juurde)
+
+pangad2 <- pangad2 %>% 
+  data.frame(., stringsAsFactors = F) %>%
+  mutate_at(names(pangad2)[names(pangad2) %in% c("KUUPAEV", "KUUPAEV2")], as.Date)
+pangad2 <- pangad2 %>% 
+  mutate_at(names(pangad2)[! names(pangad2) %in% c("KUUPAEV", "KUUPAEV2")], as.numeric) #%>% 
+#mutate_if(is.numeric, function(x) x/1000)
+
+pangad_alus <- pangad2
+
+# Tsükliga iga panga läbimine joonisele lisamiseks
+# ennustused freimi
+
+for (tunnus in names(pangad2)[!names(pangad2) %in% c("KUUPAEV", "KUUPAEV2", "ennustus")]){
+  # pangad2 <- pangad_alus
+  lo <- loess(pangad_alus[[tunnus]][!is.na(pangad_alus[[tunnus]])]
+              ~ seq_along((pangad_alus$KUUPAEV[!is.na(pangad_alus$KUUPAEV)])), control = loess.control(surface = "direct"))
+  
+  pangad2 <- pangad2 %>% 
+    # select(-KUUPAEV) %>% 
+    mutate(!! as.name(paste0("ennustus_", tunnus)) := predict(lo,newdata = 1:nrow(pangad2))) %>% 
+    mutate(KUUPAEV2 = as.Date(KUUPAEV2)) %>% 
+    mutate(!! as.name(paste0("ennustus_", tunnus)) := 
+             ifelse(!! as.name(paste0("ennustus_", tunnus)) < 0, 0, 
+                    !!  as.name(paste0("ennustus_", tunnus))))
+}
+
+# graafimine
+# for (i in names(pangad2)[!names(pangad2) %in% c("KUUPAEV", "KUUPAEV2", "ennustus")])
+
+ggplot(pangad2, aes(x = KUUPAEV2, y = ennustus_BIG)) + 
+  geom_point(aes(x = KUUPAEV2,y = SWED, colour = "SWED")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_SWED))
+
+joonis <- ggplot(pangad2, aes(x = KUUPAEV2, y = ennustus_BIG)) + 
+  geom_point(aes(x = KUUPAEV2, y = BIG, colour = "BIG")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_BIG)) + 
+  geom_point(aes(x = KUUPAEV2,y = SWED, colour = "SWED")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_SWED)) +
+  geom_point(aes(x = KUUPAEV2,y = COOP , colour = "COOP")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_COOP)) +
+  geom_point(aes(x = KUUPAEV2,y = HANDELSB , colour = "HANDELSB")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_HANDELSB)) +
+  geom_point(aes(x = KUUPAEV2,y = LHV , colour = "LHV")) +
+  geom_line(aes(x = KUUPAEV2,y = ennustus_LHV)) +
+  scale_x_date(date_breaks = "1 year") + 
+  labs(colour = "Bank") +
+  labs(x = "Date") + 
+  labs(y =  "Granted loans") + 
+  scale_y_continuous(labels = function(x) format(x, scientific = F)) + 
+  scale_y_continuous(trans = log2_trans())
+
